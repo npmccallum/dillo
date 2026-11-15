@@ -154,6 +154,7 @@ libc = "0.2"
 [profile.release]
 opt-level = 3
 lto = "thin"
+strip = true
 
 [profile.dev.package.tatu]
 opt-level = 3
