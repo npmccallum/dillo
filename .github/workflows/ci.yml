@@ -98,7 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features
-      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --all-features
+      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features
 
   # Real same-arch guest boot on every supported platform. dillo builds its
   # per-OS backend (KVM on Linux, WHP on Windows, HVF on macOS) and boots an
