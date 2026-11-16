@@ -1,199 +1,108 @@
-# virtio-console: named MULTIPORT ports — design
+# Virtio-console design
 
-Grounding design for extending dillo's singular virtio-console with named
-MULTIPORT ports. This document locks CLI/schema/device rules only. A later
-three-way consensus plan covers implementation sequencing; do not treat this
-file as a crate patch list or build plan.
+The console follows [Dillo's machine and composition rules](../../DESIGN.md).
+Its behavior is shared across transports and host platforms. Host endpoint
+adoption, I/O, notifications, execution, and confinement conform to the selected
+Machine's service interfaces and associated types. Endpoints and device
+processes may be established independently or early; their construction need
+not pass through a live Machine instance.
 
-## Scope & locked decisions
+## Device and discovery
 
-### Device
+A configured console is one virtio-console device (device ID 3), with port 0
+and optional additional named ports. It is discovered through its specified
+virtio-mmio or PCI transport. The devicetree does not describe the console or
+its ports (DT-006).
 
-- **One** plugged virtio-console (virtio device ID **3**). No second console
-  instance for named ports. No new virtio device ID.
-- Negotiate `VIRTIO_CONSOLE_F_MULTIPORT` when the layout's `ports=` list is
-  present (non-empty after parse), or when `--console-resize` is supplied.
-  Without either, keep the two-queue single-port console behavior.
-- **DT-006** (see top-level `DESIGN-RULES.md`): discovery via virtio-mmio or
-  PCI. The device tree may declare those transports; it must **not** describe
-  virtio-console devices or their ports. Platform UART / early serial may stay
-  DT-governed when present.
+Port 0 is always present and unnamed, connected to stdio. Named ports receive
+IDs 1 through N in configuration order; they do not replace port 0.
 
-### Port 0 vs named ports
+Offer `VIRTIO_CONSOLE_F_MULTIPORT` when named ports are nonempty or a resize
+endpoint is configured. Otherwise use the single-port, two-queue behavior.
+When MULTIPORT is negotiated, queues 0/1 serve port 0, queues 2/3 serve control,
+and queues `2i+2`/`2i+3` serve named port i. `max_nr_ports` is `1+N`.
+Transport interrupt capacity must cover the device's queues and configuration.
 
-| Port | How it appears | Host wiring |
-|------|----------------|-------------|
-| **0** (unnamed) | Always present when `endpoint=stdio`; guest `hvc0` as today | Wired to the console endpoint (stdio) |
-| **1..N** | Each entry in `ports=` is an **additional** named MULTIPORT port | Per-port `rx` / `tx` pipe backends (or closed) |
+## Configuration contract
 
-`ports=` does **not** replace port 0. With `endpoint=stdio`, port 0 remains the
-implied unnamed hvc0 path; named ports are extras advertised over the control
-plane.
+Console configuration is singular: `Layout.console`, with a nested `ports`
+list. CLI and JSON express the same schema. Ports are not separate devices or
+separate console arguments.
 
-### CLI / layout (house style)
-
-Extend the singular top-level `ConsoleSpec` — nested `ports` list, same shape
-as gpt `partitions=[[…]]` and net `forwards=[…]`. Same schema for CLI and JSON
-(argh + serde_keyvalue + dillo-config). Console stays on `Layout.console`; it
-does **not** move into `devices[]`.
-
-**CLI:**
-
+```text
+--console endpoint=stdio,bus=mmio,ports=[[name=build,rx=pipe:3,tx=pipe:4],[name=log,tx=pipe:5]]
 ```
---console endpoint=stdio,ports=[[name=build,rx=pipe:3,tx=pipe:4],[name=log,tx=pipe:5]]
-```
-
-**JSON:**
 
 ```json
-"console": {
-  "endpoint": "stdio",
-  "ports": [
-    {"name": "build", "rx": "pipe:3", "tx": "pipe:4"},
-    {"name": "log", "tx": "pipe:5"}
-  ]
+{
+  "console": {
+    "endpoint": "stdio",
+    "bus": "mmio",
+    "ports": [
+      {"name": "build", "rx": "pipe:3", "tx": "pipe:4"},
+      {"name": "log", "tx": "pipe:5"}
+    ]
+  }
 }
 ```
 
-Bare `--console stdio` (no `ports=`) remains valid and means today's single-port
-console unless `--console-resize` is also supplied.
+| Field | Requirement |
+| --- | --- |
+| `endpoint` | `stdio`; explicit when named ports are nonempty, otherwise defaults to `stdio`. |
+| `bus` | Required; selects an available declared bus, with no global default. |
+| `slot` | Optional exact placement under DT-004. |
+| `ports` | Optional list, empty by default; at most 31 named ports. |
 
-### Host terminal resize
+Thus `--console bus=mmio` configures a single-port console unless resize is
+also requested. Examples using `mmio` require that transport in the PMI.
 
-`--console-resize ENDPOINT` creates a private Unix socket on Linux/macOS or
-named pipe on Windows. Each connection sends one four-byte update: nonzero
-columns followed by nonzero rows, each a little-endian u16. The shared type is
-`dillo_config::ConsoleSize`. The receiver closes after consuming the update;
-senders retain their connection until that EOF, with a bounded deadline. A
-Windows client closing before accept can discard its update. There is no reply
-payload or history. Closing a resize connection does not close console input.
-Madrillo does not interpret or relay this caller–Dillo contract.
+| Named-port field | Requirement |
+| --- | --- |
+| `name` | Unique nonempty free-form name, at most 255 bytes, with no NUL. No reserved consumer names. |
+| `rx` | Optional `pipe:N`; Dillo reads host-to-guest bytes. |
+| `tx` | Optional `pipe:N`; Dillo writes guest-to-host bytes. |
 
-The endpoint enables `VIRTIO_CONSOLE_F_SIZE` and `VIRTIO_CONSOLE_F_MULTIPORT`,
-including when there are no named ports. The existing control worker accepts
-updates and sends the standard `VIRTIO_CONSOLE_RESIZE` message for port 0 after
-the guest marks it ready. Only the latest unsent size is retained. A partial
-client occupies one four-byte buffer for at most one second; the listener is
-removed at device teardown.
+At least one direction is required. An omitted direction is closed; it does
+not default to stdio. Each inherited pipe number may appear only once across
+all named ports and directions. Numbers 0, 1, and 2 are reserved for stdio.
 
-Guest resize requires Linux's
-[cols/rows fix](https://github.com/torvalds/linux/commit/5326ab737a47278dbd16ed3ee7380b26c7056ddd)
-or its backport. Older kernels, including the usual 6.1 boot-test image,
-interpret the standard dimensions in reverse. Dillo follows the standard
-format, as does [QEMU's resize implementation](https://github.com/qemu/qemu/commit/d2f8f40f01fb97fc49d5c1fb5fa98fa6233da460);
-it does not infer a guest kernel version or swap dimensions heuristically.
-The native VM resize fixture uses Fedora 44's fixed kernel and verifies
-non-square dimensions through the guest's actual hvc terminal.
+## Host endpoints
 
-## Schema
+For `pipe:N`, the parent creates an anonymous pipe and inherits its device-side
+end into Dillo. N denotes the inherited host descriptor or handle, represented
+as an unsigned 64-bit number and checked against host limits at adoption.
+A bidirectional port uses two pipes. The same layout syntax applies on all
+hosts; inheritance and ownership mechanisms belong to machine services.
 
-### `ConsoleSpec` (extended)
+Endpoint validation failures identify the affected port and direction before
+guest execution. EOF or a broken pipe closes that direction without spinning,
+aborting the VM, or disrupting other ports. Shutdown is bounded even when an
+input endpoint has no data. Each owned resource has one clear teardown owner.
 
-| field      | required | meaning |
-|------------|----------|---------|
-| `endpoint` | yes when `ports=` present; otherwise defaults to `stdio` as today | Port-0 host endpoint. v1: only `stdio` (existing resolve check). |
-| `bus`      | optional | Placement (unchanged). |
-| `slot`     | optional | Placement (unchanged). |
-| `ports`    | optional; default empty / omitted | Nested list of `ConsolePortSpec`. When present and non-empty ⇒ MULTIPORT. |
+## Guest control plane
 
-**Rule:** `endpoint` is **required** whenever `ports=` is present. Reject configs
-that set `ports=` without an explicit endpoint.
+When MULTIPORT is negotiated, use the virtio console control protocol. Wait
+for `DEVICE_READY` before announcing ports. Port 0 receives `PORT_ADD`, its
+console designation, and open-state messages, but no name. Named ports receive
+`PORT_ADD`, `PORT_NAME`, and open-state messages in protocol order, respecting
+per-port readiness. Names are NUL-terminated on the control wire. Closed
+directions carry no usable data traffic.
 
-### `ConsolePortSpec`
+The guest-visible behavior and lifecycle are independent of whether the
+machine supplies local services or process proxies.
 
-| field  | required | meaning |
-|--------|----------|---------|
-| `name` | yes | Free-form unique string among ports on this console. Not a reserved keyword space. |
-| `rx`   | no | Host→guest data path (`pipe:N`). Omit ⇒ that direction **closed**. |
-| `tx`   | no | Guest→host data path (`pipe:N`). Omit ⇒ that direction **closed**. |
+## Terminal resize
 
-**Validation:** each named port must set at least one of `rx` / `tx`; reject when both are omitted.
+`--console-resize ENDPOINT` supplies a private Unix socket on Linux/macOS or a
+named pipe on Windows through host services conforming to the Machine
+interface. Each connection carries one four-byte update: nonzero columns followed by nonzero rows, both
+little-endian u16 values. The receiver closes after consumption. The sender
+retains the connection until EOF, subject to a bounded deadline. There is no
+reply payload or history. Closing this connection does not close console
+input; Madrillo does not interpret or relay the resize contract.
 
-Names must be unique within the console's `ports` list. Uniqueness vs port 0's
-unnamed identity is automatic (port 0 has no `name` field).
-
-### Polarity (device-perspective)
-
-Align with virtio-console device TX/RX, not "operator send/receive":
-
-| field | Device sense | Data direction |
-|-------|--------------|----------------|
-| `tx=` | Device transmit | **guest → host** |
-| `rx=` | Device receive  | **host → guest** |
-
-Omitting `rx` or `tx` means that direction is **closed** (uni-directional port).
-Omission is **not** a silent default to stdio. Uni-directional ports are valid
-(e.g. build CBOR with `rx=pipe:…` only).
-
-**Reject** a named port when **both** `rx` and `tx` are omitted: at least one
-direction is required. There is no name-only / control-plane-only port.
-
-## `pipe:N` host mapping
-
-`N` is an **inherited host file-descriptor / handle number** for the device-side
-end of an anonymous pipe the **parent process** creates and passes into dillo.
-
-| value | dillo action |
-|-------|--------------|
-| `rx=pipe:N` | dillo **reads** host FD / handle `N` (host→guest) |
-| `tx=pipe:N` | dillo **writes** host FD / handle `N` (guest→host) |
-
-- Prefix is always `pipe:N` on Linux, macOS, and Windows.
-- Dual anonymous pipes are the host backend for bi-directional ports (one FD for
-  each open direction).
-- OS-specific inheritance mechanics (Unix `CLOEXEC` / pass-fd, Windows handle
-  inheritance, etc.) stay behind the host-backend boundary; the layout string
-  does not change.
-- **Not** named FIFOs, Unix domain sockets, or a second numbering scheme.
-- No operator handoff protocol beyond "parent creates pipes and inherits the
-  device-side ends into dillo as FD/handle `N`."
-
-## Guest control plane (design intent)
-
-When MULTIPORT is negotiated:
-
-1. Advertise `max_nr_ports` in virtio-console config space large enough for port 0
-   plus every named port.
-2. Use the control RX/TX queues per virtio 1.x §5.3.
-3. Announce each named port with `PORT_ADD` / `PORT_NAME` / open (and related
-   control messages) as required for Linux `hvc_virtio` / `virtio_console`.
-4. Closed directions have **no** data-path worker and no usable data queue
-   traffic in that direction.
-
-Exact message ordering and queue sizing belong in the later implementation plan;
-this design only requires conformance with the virtio 1.x multiport control
-model so stock Linux guests see named `hvc*` / virtio-console ports.
-
-## Known consumer convention (informative)
-
-Build one-shot flows may use the free-form name `dev.pichi.build` with
-`rx=pipe:…` only (host→guest CBOR). That string is a **convention**, not a
-schema reserved keyword; the layout accepts any unique free-form `name`.
-
-## Anti-patterns (reject)
-
-Do **not** accept or document:
-
-- A separate `--console-port` flag
-- Follow-on `--console port,…` after the primary `--console`
-- Packed loose `port=` without nested `[[…]]` list syntax
-- Moving console (or its ports) into `devices[]`
-
-- Named port with both `rx` and `tx` omitted (name-only / no directions)
-
-## Non-goals (this design)
-
-- No DTB or kernel-cmdline description of console ports (DT-006)
-- No second virtio-console instance dedicated to named ports
-- No port-0 endpoints other than `stdio` in v1 (keep the existing endpoint check)
-- No named FIFOs, path-based backends, or non-`pipe:` host URIs in v1
-- Implementation sequencing, crate file diffs, and test matrices — deferred to
-  a later consensus implementation plan (Dillo + Claude Opus + Codex)
-
-## Definition of done (design phase)
-
-- This document is merged (or PR-approved) as the locked surface for named
-  MULTIPORT ports.
-- Follow-on work produces a consensus implementation plan against this design,
-  then implements it; merge of implementation still requires Nathaniel's
-  explicit yes.
+Resize enables `VIRTIO_CONSOLE_F_SIZE` and `VIRTIO_CONSOLE_F_MULTIPORT`, even
+without named ports. Deliver standard `VIRTIO_CONSOLE_RESIZE` messages for
+port 0 after guest readiness. Retain only the latest unsent size. A partial
+client occupies one four-byte buffer for at most one second. Teardown removes
+the listener. Dimensions follow the protocol without guest-kernel heuristics.

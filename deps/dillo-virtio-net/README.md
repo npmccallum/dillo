@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # dillo-virtio-net
 
-In-process virtio-net device for dillo: a cross-platform frontend plus three
-host-side backends, selected with `--net backend=…`.
+Virtio-net device for Dillo, with three host connectivity modes selected
+with `--net bus=mmio,backend=…`. See [the design](DESIGN.md) for intended architecture;
+this README describes usage and validation.
 
 | backend | platforms | privilege | what it does |
 |---------|-----------|-----------|--------------|
@@ -13,6 +14,8 @@ host-side backends, selected with `--net backend=…`.
 The device itself (the `VirtioDevice`/queue marshalling) is host-agnostic; each
 backend just moves raw Ethernet frames in and out (see [`NetBackend`]).
 
+Examples select `bus=mmio`; choose a bus declared by the PMI.
+
 ## `user` — default, no privilege, everywhere
 
 A smoltcp-based transport-terminating proxy. The guest sits on a private
@@ -22,8 +25,8 @@ the proxy re-originates its flows as ordinary host sockets driven by a `mio`
 event loop. No `/dev/net/tun`, no permissions, identical on every OS.
 
 ```
---net                                              # user mode, no forwards
---net backend=user,forwards=[2222:22,udp:5353:53]  # inbound forwards (shorthand)
+--net bus=mmio                                    # user mode, no forwards
+--net bus=mmio,backend=user,forwards=[2222:22,udp:5353:53]  # inbound forwards (shorthand)
 ```
 
 Forward shorthand is `[proto:]port[:guest]` (proto defaults to `tcp`, guest
@@ -31,8 +34,8 @@ defaults to the host port, bind defaults to loopback). To bind a non-loopback
 address (e.g. expose on `0.0.0.0`), use the JSON `--layout` struct form:
 
 ```json
-{ "net": { "backend": "user",
-           "forwards": [ { "ip": "0.0.0.0", "port": 2222, "guest": 22 } ] } }
+{ "devices": [ { "net": { "bus": "mmio", "backend": "user",
+                          "forwards": [ { "ip": "0.0.0.0", "port": 2222, "guest": 22 } ] } } ] }
 ```
 
 ### Zero-config guest networking
@@ -66,8 +69,8 @@ macOS uses `vmnet` in bridged mode on the named physical interface (needs root
 or the `com.apple.vm.networking` entitlement).
 
 ```
---net backend=bridge,iface=br0     # Linux: tap enslaved to bridge br0
---net backend=bridge,iface=en0     # macOS: vmnet bridged onto en0
+--net bus=mmio,backend=bridge,iface=br0     # Linux: tap enslaved to bridge br0
+--net bus=mmio,backend=bridge,iface=en0     # macOS: vmnet bridged onto en0
 ```
 
 Bridge mode is **unsupported on Windows** (a clean error).
@@ -92,7 +95,7 @@ sudo ip link set macvtap0 address 52:54:00:ab:cd:ef up
 ```
 
 ```
---net backend=macvtap,iface=macvtap0
+--net bus=mmio,backend=macvtap,iface=macvtap0
 ```
 
 ## Testing
